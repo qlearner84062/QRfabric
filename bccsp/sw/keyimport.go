@@ -9,6 +9,8 @@ package sw
 import (
 	"crypto/ecdsa"
 	dilithium5 "crypto/pqc/dilithium/dilithium5"
+	falcon1024 "crypto/pqc/falcon/falcon1024"
+	rainbowC "pqc/rainbow/rainbowVClassic"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/asn1"
@@ -141,8 +143,17 @@ func (ki *x509PublicKeyImportOptsKeyImporter) KeyImport(raw interface{}, opts bc
 		return ki.bccsp.KeyImporters[reflect.TypeOf(&bccsp.DILITHIUMGoPublicKeyImportOpts{})].KeyImport(
 			pk,
 			&bccsp.DILITHIUMGoPublicKeyImportOpts{Temporary: opts.Ephemeral()})
+	case *falcon1024.PublicKey:
+		return ki.bccsp.KeyImporters[reflect.TypeOf(&bccsp.FALCONGoPublicKeyImportOpts{})].KeyImport(
+			pk,
+			&bccsp.FALCONGoPublicKeyImportOpts{Temporary: opts.Ephemeral()})
+
+	case *rainbowC.PublicKey:
+		return ki.bccsp.KeyImporters[reflect.TypeOf(&bccsp.RAINBOWGoPublicKeyImportOpts{})].KeyImport(
+			pk,
+			&bccsp.RAINBOWGoPublicKeyImportOpts{Temporary: opts.Ephemeral()})
 	default:
-		return nil, errors.New("Certificate's public key type not recognized. Supported keys: [ECDSA, RSA]")
+		return nil, errors.New("Certificate's public key type not recognized. Supported keys: [ECDSA, RSA, DILITHIUM, FALCON and RAINBOW]")
 	}
 }
 
@@ -155,4 +166,27 @@ func (*dilithiumGoPublicKeyImportOptsKeyImporter) KeyImport(raw interface{}, opt
 	}
 
 	return &dilithiumPublicKey{lowLevelKey}, nil
+}
+
+type falconGoPublicKeyImportOptsKeyImporter struct{}
+
+func (*falconGoPublicKeyImportOptsKeyImporter) KeyImport(raw interface{}, opts bccsp.KeyImportOpts) (bccsp.Key, error) {
+	lowLevelKey, ok := raw.(*falcon1024.PublicKey)
+	if !ok {
+		return nil, errors.New("Invalid raw material. Expected *falcon1024.PublicKey.")
+	}
+
+	return &falconPublicKey{lowLevelKey}, nil
+}
+
+
+type rainbowGoPublicKeyImportOptsKeyImporter struct{}
+
+func (*rainbowGoPublicKeyImportOptsKeyImporter) KeyImport(raw interface{}, opts bccsp.KeyImportOpts) (bccsp.Key, error) {
+	lowLevelKey, ok := raw.(*rainbowC.PublicKey)
+	if !ok {
+		return nil, errors.New("Invalid raw material. Expected *falcon1024.PublicKey.")
+	}
+
+	return &rainbowPublicKey{lowLevelKey}, nil
 }

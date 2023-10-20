@@ -61,11 +61,17 @@ func NewWithParams(securityLevel int, hashFamily string, keyStore bccsp.KeyStore
 	// Set the Signers
 	swbccsp.AddWrapper(reflect.TypeOf(&ecdsaPrivateKey{}), &ecdsaSigner{})
 	swbccsp.AddWrapper(reflect.TypeOf(&dilithiumPrivateKey{}), &dilithiumSigner{})
+	swbccsp.AddWrapper(reflect.TypeOf(&falconPrivateKey{}), &falconSigner{})
+	swbccsp.AddWrapper(reflect.TypeOf(&rainbowPrivateKey{}), &ecdsaSigner{})
+
 
 	// Set the Verifiers
 	swbccsp.AddWrapper(reflect.TypeOf(&ecdsaPrivateKey{}), &ecdsaPrivateKeyVerifier{})
 	swbccsp.AddWrapper(reflect.TypeOf(&ecdsaPublicKey{}), &ecdsaPublicKeyKeyVerifier{})
 	swbccsp.AddWrapper(reflect.TypeOf(&dilithiumPublicKey{}), &dilithiumPublicKeyKeyVerifier{})
+	swbccsp.AddWrapper(reflect.TypeOf(&falconPublicKey{}), &falconPublicKeyKeyVerifier{})
+	swbccsp.AddWrapper(reflect.TypeOf(&rainbowPublicKey{}), &rainbowPublicKeyKeyVerifier{})
+
 
 	// Set the Hashers
 	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.SHAOpts{}), &hasher{hash: conf.hashFunction})
@@ -83,6 +89,8 @@ func NewWithParams(securityLevel int, hashFamily string, keyStore bccsp.KeyStore
 	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.AES192KeyGenOpts{}), &aesKeyGenerator{length: 24})
 	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.AES128KeyGenOpts{}), &aesKeyGenerator{length: 16})
 	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.DILITHIUMKeyGenOpts{}), &dilithiumKeyGenerator{})
+	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.FALCONKeyGenOpts{}), &falconKeyGenerator{})
+	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.RAINBOWKeyGenOpts{}), &rainbowKeyGenerator{})
 
 	// Set the key deriver
 	swbccsp.AddWrapper(reflect.TypeOf(&ecdsaPrivateKey{}), &ecdsaPrivateKeyKeyDeriver{})
@@ -96,6 +104,9 @@ func NewWithParams(securityLevel int, hashFamily string, keyStore bccsp.KeyStore
 	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.ECDSAPrivateKeyImportOpts{}), &ecdsaPrivateKeyImportOptsKeyImporter{})
 	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.ECDSAGoPublicKeyImportOpts{}), &ecdsaGoPublicKeyImportOptsKeyImporter{})
 	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.DILITHIUMGoPublicKeyImportOpts{}), &dilithiumGoPublicKeyImportOptsKeyImporter{})
+	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.FALCONGoPublicKeyImportOpts{}), &falconGoPublicKeyImportOptsKeyImporter{})
+	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.RAIBOWGoPublicKeyImportOpts{}), &rainbowGoPublicKeyImportOptsKeyImporter{})
+
 	swbccsp.AddWrapper(reflect.TypeOf(&bccsp.X509PublicKeyImportOpts{}), &x509PublicKeyImportOptsKeyImporter{bccsp: swbccsp})
 
 	return swbccsp, nil

@@ -7,7 +7,7 @@ SPDX-License-Identifier: Apache-2.0
 package sw
 
 import (
-	dilithium5 "crypto/pqc/dilithium/dilithium5"
+	falcon1024 "crypto/pqc/falcon/falcon1024"
 	"crypto/sha256"
 	"crypto/x509"
 	"errors"
@@ -17,24 +17,24 @@ import (
 )
 
 /*var (
-	sigName        = "dilithium5"
-	PublicKeySize  = 2592
-	PrivateKeySize = 4864
+	sigName        = "Falcon-1024"
+	PublicKeySize  = 1793
+	PrivateKeySize = 2305
 )*/
 
-// dilithiumPrivateKey implements a bccsp.Key interface
-type dilithiumPrivateKey struct {
-	privKey *dilithium5.PrivateKey
+// falconPrivateKey implements a bccsp.Key interface
+type falconPrivateKey struct {
+	privKey *falcon1024.PrivateKey
 }
 
 // Bytes converts this key to its byte representation,
 // if this operation is allowed.
-func (k *dilithiumPrivateKey) Bytes() ([]byte, error) {
+func (k *falconPrivateKey) Bytes() ([]byte, error) {
 	return nil, errors.New("Not supported.")
 }
 
 // SKI returns the subject key identifier of this key.
-func (k *dilithiumPrivateKey) SKI() []byte {
+func (k *falconPrivateKey) SKI() []byte {
 	if k.privKey == nil {
 		return nil
 	}
@@ -43,24 +43,24 @@ func (k *dilithiumPrivateKey) SKI() []byte {
 	return hash.Sum(nil)
 }
 
-func (k *dilithiumPrivateKey) Symmetric() bool {
+func (k *falconPrivateKey) Symmetric() bool {
 	return false
 }
 
-func (k *dilithiumPrivateKey) Private() bool {
+func (k *falconPrivateKey) Private() bool {
 	return true
 }
 
-func (k *dilithiumPrivateKey) PublicKey() (bccsp.Key, error) {
-	return &dilithiumPublicKey{&k.privKey.PublicKey}, nil
+func (k *falconPrivateKey) PublicKey() (bccsp.Key, error) {
+	return &falconPublicKey{&k.privKey.PublicKey}, nil
 }
 
 // dilithiumPublicKey implements a bccsp.Key interface
-type dilithiumPublicKey struct {
-	pubKey *dilithium5.PublicKey
+type falconPublicKey struct {
+	pubKey *falcon1024.PublicKey
 }
 
-func (k *dilithiumPublicKey) Bytes() (raw []byte, err error) {
+func (k *falconPublicKey) Bytes() (raw []byte, err error) {
 	raw, err = x509.MarshalPKIXPublicKey(k.pubKey)
 	if err != nil {
 		return nil, fmt.Errorf("Failed marshalling key [%s]", err)
@@ -69,7 +69,7 @@ func (k *dilithiumPublicKey) Bytes() (raw []byte, err error) {
 }
 
 // SKI returns the subject key identifier of this key.
-func (k *dilithiumPublicKey) SKI() []byte {
+func (k *falconPublicKey) SKI() []byte {
 	if k.pubKey == nil {
 		return nil
 	}
@@ -78,14 +78,14 @@ func (k *dilithiumPublicKey) SKI() []byte {
 	return hash.Sum(nil)
 }
 
-func (k *dilithiumPublicKey) Symmetric() bool {
+func (k *falconPublicKey) Symmetric() bool {
 	return false
 }
 
-func (k *dilithiumPublicKey) Private() bool {
+func (k *falconPublicKey) Private() bool {
 	return false
 }
 
-func (k *dilithiumPublicKey) PublicKey() (bccsp.Key, error) {
+func (k *falconPublicKey) PublicKey() (bccsp.Key, error) {
 	return k, nil
 }
