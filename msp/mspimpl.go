@@ -1,1609 +1,969 @@
 /*
-Copyright IBM Corp. 2017 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
 SPDX-License-Identifier: Apache-2.0
-
 */
 
 package msp
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/sha256"
+	"bytes"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
 	"encoding/pem"
-	"errors"
-	"fmt"
-	"math/big"
-	"os"
-	"path/filepath"
-	"reflect"
-	"testing"
-	"time"
+	"strings"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger/fabric-protos-go/msp"
+	m "github.com/hyperledger/fabric-protos-go/msp"
 	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/bccsp/factory"
+	"github.com/hyperledger/fabric/bccsp/signer"
 	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/bccsp/utils"
-	"github.com/hyperledger/fabric/core/config/configtest"
-	"github.com/hyperledger/fabric/protoutil"
-	"github.com/stretchr/testify/require"
+	"github.com/pkg/errors"
 )
 
-var notACert = `-----BEGIN X509 CRL-----
-MIIBYzCCAQgCAQEwCgYIKoZIzj0EAwIwfzELMAkGA1UEBhMCVVMxEzARBgNVBAgT
-CkNhbGlmb3JuaWExFjAUBgNVBAcTDVNhbiBGcmFuY2lzY28xHzAdBgNVBAoTFklu
-dGVybmV0IFdpZGdldHMsIEluYy4xDDAKBgNVBAsTA1dXVzEUMBIGA1UEAxMLZXhh
-bXBsZS5jb20XDTE3MDEyMzIwNTYyMFoXDTE3MDEyNjIwNTYyMFowJzAlAhQERXCx
-LHROap1vM3CV40EHOghPTBcNMTcwMTIzMjA0NzMxWqAvMC0wHwYDVR0jBBgwFoAU
-F2dCPaqegj/ExR2fW8OZ0bWcSBAwCgYDVR0UBAMCAQgwCgYIKoZIzj0EAwIDSQAw
-RgIhAOTTpQYkGO+gwVe1LQOcNMD5fzFViOwBUraMrk6dRMlmAiEA8z2dpXKGwHrj
-FRBbKkDnSpaVcZgjns+mLdHV2JkF0gk=
------END X509 CRL-----`
+// mspSetupFuncType is the prototype of the setup function
+type mspSetupFuncType func(config *m.FabricMSPConfig) error
 
-func TestMSPParsers(t *testing.T) {
-	_, _, err := localMsp.(*bccspmsp).getIdentityFromConf(nil)
-	require.Error(t, err)
-	_, _, err = localMsp.(*bccspmsp).getIdentityFromConf([]byte("barf"))
-	require.Error(t, err)
-	_, _, err = localMsp.(*bccspmsp).getIdentityFromConf([]byte(notACert))
-	require.Error(t, err)
+// validateIdentityOUsFuncType is the prototype of the function to validate identity's OUs
+type validateIdentityOUsFuncType func(id *identity) error
 
-	_, err = localMsp.(*bccspmsp).getSigningIdentityFromConf(nil)
-	require.Error(t, err)
+// satisfiesPrincipalInternalFuncType is the prototype of the function to check if principals are satisfied
+type satisfiesPrincipalInternalFuncType func(id Identity, principal *m.MSPPrincipal) error
 
-	sigid := &msp.SigningIdentityInfo{PublicSigner: []byte("barf"), PrivateSigner: nil}
-	_, err = localMsp.(*bccspmsp).getSigningIdentityFromConf(sigid)
-	require.Error(t, err)
+// setupAdminInternalFuncType is a prototype of the function to setup the admins
+type setupAdminInternalFuncType func(conf *m.FabricMSPConfig) error
 
-	keyinfo := &msp.KeyInfo{KeyIdentifier: "PEER", KeyMaterial: nil}
-	sigid = &msp.SigningIdentityInfo{PublicSigner: []byte("barf"), PrivateSigner: keyinfo}
-	_, err = localMsp.(*bccspmsp).getSigningIdentityFromConf(sigid)
-	require.Error(t, err)
+// This is an instantiation of an MSP that
+// uses BCCSP for its cryptographic primitives.
+type bccspmsp struct {
+	// version specifies the behaviour of this msp
+	version MSPVersion
+	// The following function pointers are used to change the behaviour
+	// of this MSP depending on its version.
+	// internalSetupFunc is the pointer to the setup function
+	internalSetupFunc mspSetupFuncType
+
+	// internalValidateIdentityOusFunc is the pointer to the function to validate identity's OUs
+	internalValidateIdentityOusFunc validateIdentityOUsFuncType
+
+	// internalSatisfiesPrincipalInternalFunc is the pointer to the function to check if principals are satisfied
+	internalSatisfiesPrincipalInternalFunc satisfiesPrincipalInternalFuncType
+
+	// internalSetupAdmin is the pointer to the function that setup the administrators of this msp
+	internalSetupAdmin setupAdminInternalFuncType
+
+	// list of CA certs we trust
+	rootCerts []Identity
+
+	// list of intermediate certs we trust
+	intermediateCerts []Identity
+
+	// list of CA TLS certs we trust
+	tlsRootCerts [][]byte
+
+	// list of intermediate TLS certs we trust
+	tlsIntermediateCerts [][]byte
+
+	// certificationTreeInternalNodesMap whose keys correspond to the raw material
+	// (DER representation) of a certificate casted to a string, and whose values
+	// are boolean. True means that the certificate is an internal node of the certification tree.
+	// False means that the certificate corresponds to a leaf of the certification tree.
+	certificationTreeInternalNodesMap map[string]bool
+
+	// list of signing identities
+	signer SigningIdentity
+
+	// list of admin identities
+	admins []Identity
+
+	// the crypto provider
+	bccsp bccsp.BCCSP
+
+	// the provider identifier for this MSP
+	name string
+
+	// verification options for MSP members
+	opts *x509.VerifyOptions
+
+	// list of certificate revocation lists
+	CRL []*pkix.CertificateList
+
+	// list of OUs
+	ouIdentifiers map[string][][]byte
+
+	// cryptoConfig contains
+	cryptoConfig *m.FabricCryptoConfig
+
+	// NodeOUs configuration
+	ouEnforcement bool
+	// These are the OUIdentifiers of the clients, peers, admins and orderers.
+	// They are used to tell apart these entities
+	clientOU, peerOU, adminOU, ordererOU *OUIdentifier
 }
 
-func TestGetSigningIdentityFromConfWithWrongPrivateCert(t *testing.T) {
-	// Temporary Replace root certs
-	oldRoots := localMsp.(*bccspmsp).opts.Roots
-	defer func() {
-		// Restore original root certs
-		localMsp.(*bccspmsp).opts.Roots = oldRoots
-	}()
-	_, cert := generateSelfSignedCert(t, time.Now())
-	localMsp.(*bccspmsp).opts.Roots = x509.NewCertPool()
-	localMsp.(*bccspmsp).opts.Roots.AddCert(cert)
+// newBccspMsp returns an MSP instance backed up by a BCCSP
+// crypto provider. It handles x.509 certificates and can
+// generate identities and signing identities backed by
+// certificates and keypairs
+func newBccspMsp(version MSPVersion, defaultBCCSP bccsp.BCCSP) (MSP, error) {
+	mspLogger.Debugf("Creating BCCSP-based MSP instance")
 
-	// Use self signed cert as public key. Convert DER to PEM format
-	pem := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
-
-	// Use wrong formatted private cert
-	keyinfo := &msp.KeyInfo{
-		KeyMaterial:   []byte("wrong encoding"),
-		KeyIdentifier: "MyPrivateKey",
+	theMsp := &bccspmsp{}
+	theMsp.version = version
+	theMsp.bccsp = defaultBCCSP
+	switch version {
+	case MSPv1_0:
+		theMsp.internalSetupFunc = theMsp.setupV1
+		theMsp.internalValidateIdentityOusFunc = theMsp.validateIdentityOUsV1
+		theMsp.internalSatisfiesPrincipalInternalFunc = theMsp.satisfiesPrincipalInternalPreV13
+		theMsp.internalSetupAdmin = theMsp.setupAdminsPreV142
+	case MSPv1_1:
+		theMsp.internalSetupFunc = theMsp.setupV11
+		theMsp.internalValidateIdentityOusFunc = theMsp.validateIdentityOUsV11
+		theMsp.internalSatisfiesPrincipalInternalFunc = theMsp.satisfiesPrincipalInternalPreV13
+		theMsp.internalSetupAdmin = theMsp.setupAdminsPreV142
+	case MSPv1_3:
+		theMsp.internalSetupFunc = theMsp.setupV11
+		theMsp.internalValidateIdentityOusFunc = theMsp.validateIdentityOUsV11
+		theMsp.internalSatisfiesPrincipalInternalFunc = theMsp.satisfiesPrincipalInternalV13
+		theMsp.internalSetupAdmin = theMsp.setupAdminsPreV142
+	case MSPv1_4_3:
+		theMsp.internalSetupFunc = theMsp.setupV142
+		theMsp.internalValidateIdentityOusFunc = theMsp.validateIdentityOUsV142
+		theMsp.internalSatisfiesPrincipalInternalFunc = theMsp.satisfiesPrincipalInternalV142
+		theMsp.internalSetupAdmin = theMsp.setupAdminsV142
+	default:
+		return nil, errors.Errorf("Invalid MSP version [%v]", version)
 	}
-	sigid := &msp.SigningIdentityInfo{PublicSigner: pem, PrivateSigner: keyinfo}
-	_, err := localMsp.(*bccspmsp).getSigningIdentityFromConf(sigid)
-	require.EqualError(t, err, "MyPrivateKey: wrong PEM encoding")
+
+	return theMsp, nil
 }
 
-func TestMSPSetupNoCryptoConf(t *testing.T) {
-	mspDir := configtest.GetDevMspDir()
-	conf, err := GetLocalMspConfig(mspDir, nil, "SampleOrg")
-	if err != nil {
-		fmt.Printf("Setup should have succeeded, got err %s instead", err)
-		os.Exit(-1)
-	}
-
-	mspconf := &msp.FabricMSPConfig{}
-	err = proto.Unmarshal(conf.Config, mspconf)
-	require.NoError(t, err)
-
-	// here we test the case of an MSP configuration
-	// where the hash function to be used to obtain
-	// the identity identifier is unspecified - a
-	// sane default should be picked
-	mspconf.CryptoConfig.IdentityIdentifierHashFunction = ""
-	b, err := proto.Marshal(mspconf)
-	require.NoError(t, err)
-	conf.Config = b
-	newmsp, err := newBccspMsp(MSPv1_0, factory.GetDefault())
-	require.NoError(t, err)
-	err = newmsp.Setup(conf)
-	require.NoError(t, err)
-
-	// here we test the case of an MSP configuration
-	// where the hash function to be used to compute
-	// signatures is unspecified - a sane default
-	// should be picked
-	mspconf.CryptoConfig.SignatureHashFamily = ""
-	b, err = proto.Marshal(mspconf)
-	require.NoError(t, err)
-	conf.Config = b
-	newmsp, err = newBccspMsp(MSPv1_0, factory.GetDefault())
-	require.NoError(t, err)
-	err = newmsp.Setup(conf)
-	require.NoError(t, err)
-
-	// here we test the case of an MSP configuration
-	// that has NO crypto configuration specified;
-	// the code will use appropriate defaults
-	mspconf.CryptoConfig = nil
-	b, err = proto.Marshal(mspconf)
-	require.NoError(t, err)
-	conf.Config = b
-	newmsp, err = newBccspMsp(MSPv1_0, factory.GetDefault())
-	require.NoError(t, err)
-	err = newmsp.Setup(conf)
-	require.NoError(t, err)
-}
-
-func TestGetters(t *testing.T) {
-	typ := localMsp.GetType()
-	require.Equal(t, typ, FABRIC)
-	require.NotNil(t, localMsp.GetTLSRootCerts())
-	require.NotNil(t, localMsp.GetTLSIntermediateCerts())
-}
-
-func TestMSPSetupBad(t *testing.T) {
-	_, err := GetLocalMspConfig("barf", nil, "SampleOrg")
-	if err == nil {
-		t.Fatalf("Setup should have failed on an invalid config file")
-		return
-	}
-
-	mgr := NewMSPManager()
-	err = mgr.Setup(nil)
-	require.NoError(t, err)
-	err = mgr.Setup([]MSP{})
-	require.NoError(t, err)
-}
-
-func TestDoubleSetup(t *testing.T) {
-	// note that we've already called setup once on this
-	err := mspMgr.Setup(nil)
-	require.NoError(t, err)
-}
-
-type bccspNoKeyLookupKS struct {
-	bccsp.BCCSP
-}
-
-func (*bccspNoKeyLookupKS) GetKey(ski []byte) (k bccsp.Key, err error) {
-	return nil, errors.New("not found")
-}
-
-func TestNotFoundInBCCSP(t *testing.T) {
-	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
-	require.NoError(t, err)
-
-	dir := configtest.GetDevMspDir()
-	conf, err := GetLocalMspConfig(dir, nil, "SampleOrg")
-
-	require.NoError(t, err)
-
-	thisMSP, err := newBccspMsp(MSPv1_0, cryptoProvider)
-	require.NoError(t, err)
-	ks, err := sw.NewFileBasedKeyStore(nil, filepath.Join(dir, "keystore"), true)
-	require.NoError(t, err)
-	csp, err := sw.NewWithParams(256, "SHA2", ks)
-	require.NoError(t, err)
-	thisMSP.(*bccspmsp).bccsp = &bccspNoKeyLookupKS{csp}
-
-	err = thisMSP.Setup(conf)
-	require.Error(t, err)
-	require.Contains(t, "KeyMaterial not found in SigningIdentityInfo", err.Error())
-}
-
-func TestGetIdentities(t *testing.T) {
-	_, err := localMsp.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity failed with err %s", err)
-		return
-	}
-}
-
-func TestDeserializeIdentityFails(t *testing.T) {
-	_, err := localMsp.DeserializeIdentity([]byte("barf"))
-	require.Error(t, err)
-
-	id := &msp.SerializedIdentity{Mspid: "SampleOrg", IdBytes: []byte("barfr")}
-	b, err := proto.Marshal(id)
-	require.NoError(t, err)
-	_, err = localMsp.DeserializeIdentity(b)
-	require.Error(t, err)
-
-	id = &msp.SerializedIdentity{Mspid: "SampleOrg", IdBytes: []byte(notACert)}
-	b, err = proto.Marshal(id)
-	require.NoError(t, err)
-	_, err = localMsp.DeserializeIdentity(b)
-	require.Error(t, err)
-}
-
-func TestGetSigningIdentityFromVerifyingMSP(t *testing.T) {
-	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
-	require.NoError(t, err)
-
-	mspDir := configtest.GetDevMspDir()
-	conf, err = GetVerifyingMspConfig(mspDir, "SampleOrg", ProviderTypeToString(FABRIC))
-	if err != nil {
-		fmt.Printf("Setup should have succeeded, got err %s instead", err)
-		os.Exit(-1)
-	}
-
-	newmsp, err := newBccspMsp(MSPv1_0, cryptoProvider)
-	require.NoError(t, err)
-	err = newmsp.Setup(conf)
-	require.NoError(t, err)
-
-	_, err = newmsp.GetDefaultSigningIdentity()
-	require.Error(t, err)
-}
-
-func TestValidateDefaultSigningIdentity(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	err = localMsp.Validate(id.GetPublicVersion())
-	require.NoError(t, err)
-}
-
-func TestSerializeIdentities(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded, got err %s", err)
-		return
-	}
-
-	serializedID, err := id.Serialize()
-	if err != nil {
-		t.Fatalf("Serialize should have succeeded, got err %s", err)
-		return
-	}
-
-	idBack, err := localMsp.DeserializeIdentity(serializedID)
-	if err != nil {
-		t.Fatalf("DeserializeIdentity should have succeeded, got err %s", err)
-		return
-	}
-
-	err = localMsp.Validate(idBack)
-	if err != nil {
-		t.Fatalf("The identity should be valid, got err %s", err)
-		return
-	}
-
-	if !reflect.DeepEqual(id.GetPublicVersion(), idBack) {
-		t.Fatalf("Identities should be equal (%s) (%s)", id, idBack)
-		return
-	}
-}
-
-func computeSKI(key *ecdsa.PublicKey) []byte {
-	raw := elliptic.Marshal(key.Curve, key.X, key.Y)
-	hash := sha256.Sum256(raw)
-	return hash[:]
-}
-
-func TestValidHostname(t *testing.T) {
-	tests := []struct {
-		name  string
-		valid bool
-	}{
-		{"", false},
-		{".", false},
-		{"example.com", true},
-		{"example.com.", true},
-		{"*.example.com", true},
-		{".example.com", false},
-		{"host.*.example.com", false},
-		{"localhost", true},
-		{"-localhost", false},
-		{"Not_Quite.example.com", true},
-		{"weird:colon.example.com", true},
-		{"1-2-3.example.com", true},
-	}
-	for _, tt := range tests {
-		if tt.valid {
-			require.True(t, validHostname(tt.name), "expected %s to be a valid hostname", tt.name)
-		} else {
-			require.False(t, validHostname(tt.name), "expected %s to be an invalid hostname", tt.name)
-		}
-	}
-}
-
-func TestValidateCANameConstraintsMitigation(t *testing.T) {
-	// Prior to Go 1.15, if a signing certificate contains a name constraint, the
-	// leaf certificate does not include a SAN, and the leaf common name looks
-	// like a valid hostname, the certificate chain would fail to validate.
-	// (This behavior may have been introduced with Go 1.10.)
-	//
-	// In Go 1.15, the behavior has changed and, by default, the same structure
-	// will validate. This test asserts on the old behavior.
-	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	caKeyUsage := x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign | x509.KeyUsageCRLSign
-	caTemplate := x509.Certificate{
-		Subject:                     pkix.Name{CommonName: "TestCA"},
-		SerialNumber:                big.NewInt(1),
-		NotBefore:                   time.Now().Add(-1 * time.Hour),
-		NotAfter:                    time.Now().Add(2 * time.Hour),
-		ExcludedDNSDomains:          []string{"example.com"},
-		PermittedDNSDomainsCritical: true,
-		IsCA:                        true,
-		BasicConstraintsValid:       true,
-		KeyUsage:                    caKeyUsage,
-		SubjectKeyId:                computeSKI(caKey.Public().(*ecdsa.PublicKey)),
-	}
-	caCertBytes, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, caKey.Public(), caKey)
-	require.NoError(t, err)
-	ca, err := x509.ParseCertificate(caCertBytes)
-	require.NoError(t, err)
-
-	leafTemplate := x509.Certificate{
-		Subject:      pkix.Name{CommonName: "localhost"},
-		SerialNumber: big.NewInt(2),
-		NotBefore:    time.Now().Add(-1 * time.Hour),
-		NotAfter:     time.Now().Add(2 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		SubjectKeyId: computeSKI(leafKey.Public().(*ecdsa.PublicKey)),
-	}
-	leafCertBytes, err := x509.CreateCertificate(rand.Reader, &leafTemplate, ca, leafKey.Public(), caKey)
-	require.NoError(t, err)
-
-	keyBytes, err := x509.MarshalPKCS8PrivateKey(leafKey)
-	require.NoError(t, err)
-
-	caCertPem := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caCertBytes})
-	leafCertPem := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafCertBytes})
-	leafKeyPem := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes})
-
-	t.Run("VerifyNameConstraintsSingleCert", func(t *testing.T) {
-		for _, der := range [][]byte{caCertBytes, leafCertBytes} {
-			cert, err := x509.ParseCertificate(der)
-			require.NoError(t, err, "failed to parse certificate")
-
-			err = verifyLegacyNameConstraints([]*x509.Certificate{cert})
-			require.NoError(t, err, "single certificate should not trigger legacy constraints")
-		}
-	})
-
-	t.Run("VerifyNameConstraints", func(t *testing.T) {
-		var certs []*x509.Certificate
-		for _, der := range [][]byte{leafCertBytes, caCertBytes} {
-			cert, err := x509.ParseCertificate(der)
-			require.NoError(t, err, "failed to parse certificate")
-			certs = append(certs, cert)
-		}
-
-		err = verifyLegacyNameConstraints(certs)
-		require.Error(t, err, "certificate chain should trigger legacy constraints")
-		var cie x509.CertificateInvalidError
-		require.True(t, errors.As(err, &cie))
-		require.Equal(t, x509.NameConstraintsWithoutSANs, cie.Reason)
-	})
-
-	t.Run("VerifyNameConstraintsWithSAN", func(t *testing.T) {
-		caCert, err := x509.ParseCertificate(caCertBytes)
-		require.NoError(t, err)
-
-		leafTemplate := leafTemplate
-		leafTemplate.DNSNames = []string{"localhost"}
-
-		leafCertBytes, err := x509.CreateCertificate(rand.Reader, &leafTemplate, caCert, leafKey.Public(), caKey)
-		require.NoError(t, err)
-
-		leafCert, err := x509.ParseCertificate(leafCertBytes)
-		require.NoError(t, err)
-
-		err = verifyLegacyNameConstraints([]*x509.Certificate{leafCert, caCert})
-		require.NoError(t, err, "signer with name constraints and leaf with SANs should be valid")
-	})
-
-	t.Run("ValidationAtSetup", func(t *testing.T) {
-		fabricMSPConfig := &msp.FabricMSPConfig{
-			Name:      "ConstraintsMSP",
-			RootCerts: [][]byte{caCertPem},
-			SigningIdentity: &msp.SigningIdentityInfo{
-				PublicSigner: leafCertPem,
-				PrivateSigner: &msp.KeyInfo{
-					KeyIdentifier: "Certificate Without SAN",
-					KeyMaterial:   leafKeyPem,
-				},
-			},
-		}
-		mspConfig := &msp.MSPConfig{
-			Config: protoutil.MarshalOrPanic(fabricMSPConfig),
-		}
-
-		ks, err := sw.NewFileBasedKeyStore(nil, filepath.Join(configtest.GetDevMspDir(), "keystore"), true)
-		require.NoError(t, err)
-		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(ks)
-		require.NoError(t, err)
-
-		testMSP, err := NewBccspMspWithKeyStore(MSPv1_0, ks, cryptoProvider)
-		require.NoError(t, err)
-
-		err = testMSP.Setup(mspConfig)
-		require.Error(t, err)
-		var cie x509.CertificateInvalidError
-		require.True(t, errors.As(err, &cie))
-		require.Equal(t, x509.NameConstraintsWithoutSANs, cie.Reason)
-	})
-}
-
-func TestIsWellFormed(t *testing.T) {
-	mspMgr := NewMSPManager()
-
-	id, err := localMsp.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded, got err %s", err)
-		return
-	}
-
-	serializedID, err := id.Serialize()
-	if err != nil {
-		t.Fatalf("Serialize should have succeeded, got err %s", err)
-		return
-	}
-
-	sId := &msp.SerializedIdentity{}
-	err = proto.Unmarshal(serializedID, sId)
-	require.NoError(t, err)
-
-	// An MSP Manager without any MSPs should not recognize the identity since
-	// not providers are registered
-	err = mspMgr.IsWellFormed(sId)
-	require.Error(t, err)
-	require.Equal(t, "no MSP provider recognizes the identity", err.Error())
-
-	// Add the MSP to the MSP Manager
-	mspMgr.Setup([]MSP{localMsp})
-
-	err = localMsp.IsWellFormed(sId)
-	require.NoError(t, err)
-	err = mspMgr.IsWellFormed(sId)
-	require.NoError(t, err)
-
-	bl, _ := pem.Decode(sId.IdBytes)
-	require.Equal(t, "CERTIFICATE", bl.Type)
-
-	// Now, strip off the type from the PEM block. It should still be valid
-	bl.Type = ""
-	sId.IdBytes = pem.EncodeToMemory(bl)
-
-	err = localMsp.IsWellFormed(sId)
-	require.NoError(t, err)
-
-	// Now, corrupt the type of the PEM block.
-	// make sure it isn't considered well formed by both an MSP and an MSP Manager
-	bl.Type = "foo"
-	sId.IdBytes = pem.EncodeToMemory(bl)
-	err = localMsp.IsWellFormed(sId)
-
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "pem type is")
-	require.Contains(t, err.Error(), "should be 'CERTIFICATE' or missing")
-
-	err = mspMgr.IsWellFormed(sId)
-	require.Error(t, err)
-	require.Equal(t, "no MSP provider recognizes the identity", err.Error())
-
-	// Restore the identity to what it was
-	sId = &msp.SerializedIdentity{}
-	err = proto.Unmarshal(serializedID, sId)
-	require.NoError(t, err)
-
-	// Append some trailing junk at the end
-	sId.IdBytes = append(sId.IdBytes, []byte{1, 2, 3}...)
-	// And ensure it is deemed invalid
-	err = localMsp.IsWellFormed(sId)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "for MSP SampleOrg has trailing bytes")
-
-	// Parse the certificate of the identity
-	cert, err := x509.ParseCertificate(bl.Bytes)
-	require.NoError(t, err)
-	// Obtain the ECDSA signature
-	r, s, err := utils.UnmarshalECDSASignature(cert.Signature)
-	require.NoError(t, err)
-
-	// Modify it by appending some bytes to its end.
-	modifiedSig, err := asn1.Marshal(rst{
-		R: r,
-		S: s,
-		T: big.NewInt(100),
-	})
-	require.NoError(t, err)
-	newCert, err := certFromX509Cert(cert)
-	require.NoError(t, err)
-	newCert.SignatureValue.Bytes = modifiedSig
-	newCert.SignatureValue.BitLength = len(newCert.SignatureValue.Bytes) * 8
-	newCert.Raw = nil
-	// Pour it back into the identity
-	rawCert, err := asn1.Marshal(newCert)
-	require.NoError(t, err)
-	sId.IdBytes = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rawCert})
-	// Ensure it is invalid now and the signature modification is detected
-	err = localMsp.IsWellFormed(sId)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "for MSP SampleOrg has a non canonical signature")
-}
-
-type rst struct {
-	R, S, T *big.Int
-}
-
-func TestValidateCAIdentity(t *testing.T) {
-	caID := getIdentity(t, cacerts)
-
-	err := localMsp.Validate(caID)
-	require.Error(t, err)
-}
-
-func TestBadAdminIdentity(t *testing.T) {
-	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
-	require.NoError(t, err)
-
-	conf, err := GetLocalMspConfig("testdata/badadmin", nil, "SampleOrg")
-	require.NoError(t, err)
-
-	thisMSP, err := newBccspMsp(MSPv1_0, cryptoProvider)
-	require.NoError(t, err)
-	ks, err := sw.NewFileBasedKeyStore(nil, filepath.Join("testdata/badadmin", "keystore"), true)
-	require.NoError(t, err)
-	csp, err := sw.NewWithParams(256, "SHA2", ks)
-	require.NoError(t, err)
-	thisMSP.(*bccspmsp).bccsp = csp
-
-	err = thisMSP.Setup(conf)
-	require.Error(t, err)
-}
-
-func TestValidateAdminIdentity(t *testing.T) {
-	caID := getIdentity(t, admincerts)
-
-	err := localMsp.Validate(caID)
-	require.NoError(t, err)
-}
-
-func TestSerializeIdentitiesWithWrongMSP(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded, got err %s", err)
-		return
-	}
-
-	serializedID, err := id.Serialize()
-	if err != nil {
-		t.Fatalf("Serialize should have succeeded, got err %s", err)
-		return
-	}
-
-	sid := &msp.SerializedIdentity{}
-	err = proto.Unmarshal(serializedID, sid)
-	require.NoError(t, err)
-
-	sid.Mspid += "BARF"
-
-	serializedID, err = proto.Marshal(sid)
-	require.NoError(t, err)
-
-	_, err = localMsp.DeserializeIdentity(serializedID)
-	require.Error(t, err)
-}
-
-func TestSerializeIdentitiesWithMSPManager(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded, got err %s", err)
-		return
-	}
-
-	serializedID, err := id.Serialize()
-	if err != nil {
-		t.Fatalf("Serialize should have succeeded, got err %s", err)
-		return
-	}
-
-	_, err = mspMgr.DeserializeIdentity(serializedID)
-	require.NoError(t, err)
-
-	sid := &msp.SerializedIdentity{}
-	err = proto.Unmarshal(serializedID, sid)
-	require.NoError(t, err)
-
-	sid.Mspid += "BARF"
-
-	serializedID, err = proto.Marshal(sid)
-	require.NoError(t, err)
-
-	_, err = mspMgr.DeserializeIdentity(serializedID)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), fmt.Sprintf("MSP %s is not defined on channel", sid.Mspid))
-
-	_, err = mspMgr.DeserializeIdentity([]byte("barf"))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "could not deserialize")
-}
-
-func TestIdentitiesGetters(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded, got err %s", err)
-		return
-	}
-
-	idid := id.GetIdentifier()
-	require.NotNil(t, idid)
-	mspid := id.GetMSPIdentifier()
-	require.NotNil(t, mspid)
-	require.False(t, id.Anonymous())
-}
-
-func TestSignAndVerify(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded")
-		return
-	}
-
-	serializedID, err := id.Serialize()
-	if err != nil {
-		t.Fatalf("Serialize should have succeeded")
-		return
-	}
-
-	idBack, err := localMsp.DeserializeIdentity(serializedID)
-	if err != nil {
-		t.Fatalf("DeserializeIdentity should have succeeded")
-		return
-	}
-
-	msg := []byte("foo")
-	sig, err := id.Sign(msg)
-	if err != nil {
-		t.Fatalf("Sign should have succeeded")
-		return
-	}
-
-	err = id.Verify(msg, sig)
-	if err != nil {
-		t.Fatalf("The signature should be valid")
-		return
-	}
-
-	err = idBack.Verify(msg, sig)
-	if err != nil {
-		t.Fatalf("The signature should be valid")
-		return
-	}
-
-	err = id.Verify(msg[1:], sig)
-	require.Error(t, err)
-	err = id.Verify(msg, sig[1:])
-	require.Error(t, err)
-}
-
-func TestSignAndVerifyFailures(t *testing.T) {
-	msg := []byte("foo")
-
-	id, err := localMspBad.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded")
-		return
-	}
-
-	hash := id.(*signingidentity).msp.cryptoConfig.SignatureHashFamily
-	id.(*signingidentity).msp.cryptoConfig.SignatureHashFamily = "barf"
-
-	_, err = id.Sign(msg)
-	require.Error(t, err)
-
-	id.(*signingidentity).msp.cryptoConfig.SignatureHashFamily = hash
-
-	sig, err := id.Sign(msg)
-	if err != nil {
-		t.Fatalf("Sign should have succeeded")
-		return
-	}
-
-	id.(*signingidentity).msp.cryptoConfig.SignatureHashFamily = "barf"
-
-	err = id.Verify(msg, sig)
-	require.Error(t, err)
-
-	id.(*signingidentity).msp.cryptoConfig.SignatureHashFamily = hash
-}
-
-func TestSignAndVerifyOtherHash(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded")
-		return
-	}
-
-	hash := id.(*signingidentity).msp.cryptoConfig.SignatureHashFamily
-	id.(*signingidentity).msp.cryptoConfig.SignatureHashFamily = bccsp.SHA3
-
-	msg := []byte("foo")
-	sig, err := id.Sign(msg)
-	if err != nil {
-		t.Fatalf("Sign should have succeeded")
-		return
-	}
-
-	err = id.Verify(msg, sig)
-	require.NoError(t, err)
-
-	id.(*signingidentity).msp.cryptoConfig.SignatureHashFamily = hash
-}
-
-func TestSignAndVerify_longMessage(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded")
-		return
-	}
-
-	serializedID, err := id.Serialize()
-	if err != nil {
-		t.Fatalf("Serialize should have succeeded")
-		return
-	}
-
-	idBack, err := localMsp.DeserializeIdentity(serializedID)
-	if err != nil {
-		t.Fatalf("DeserializeIdentity should have succeeded")
-		return
-	}
-
-	msg := []byte("ABCDEFGABCDEFGABCDEFGABCDEFGABCDEFGABCDEFGABCDEFGABCDEFGABCDEFGABCDEFGABCDEFGABCDEFGABCDEFGABCDEFG")
-	sig, err := id.Sign(msg)
-	if err != nil {
-		t.Fatalf("Sign should have succeeded")
-		return
-	}
-
-	err = id.Verify(msg, sig)
-	if err != nil {
-		t.Fatalf("The signature should be valid")
-		return
-	}
-
-	err = idBack.Verify(msg, sig)
-	if err != nil {
-		t.Fatalf("The signature should be valid")
-		return
-	}
-}
-
-func TestGetOU(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded")
-		return
-	}
-
-	require.Equal(t, "COP", id.GetOrganizationalUnits()[0].OrganizationalUnitIdentifier)
-}
-
-func TestGetOUFail(t *testing.T) {
-	id, err := localMspBad.GetDefaultSigningIdentity()
-	if err != nil {
-		t.Fatalf("GetDefaultSigningIdentity should have succeeded")
-		return
-	}
-
-	certTmp := id.(*signingidentity).cert
-	id.(*signingidentity).cert = nil
-	ou := id.GetOrganizationalUnits()
-	require.Nil(t, ou)
-
-	id.(*signingidentity).cert = certTmp
-
-	opts := id.(*signingidentity).msp.opts
-	id.(*signingidentity).msp.opts = nil
-	ou = id.GetOrganizationalUnits()
-	require.Nil(t, ou)
-
-	id.(*signingidentity).msp.opts = opts
-}
-
-func TestCertificationIdentifierComputation(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	chain, err := localMsp.(*bccspmsp).getCertificationChain(id.GetPublicVersion())
-	require.NoError(t, err)
-
-	// Hash the chain
-	// Use the hash of the identity's certificate as id in the IdentityIdentifier
-	hashOpt, err := bccsp.GetHashOpt(localMsp.(*bccspmsp).cryptoConfig.IdentityIdentifierHashFunction)
-	require.NoError(t, err)
-
-	hf, err := localMsp.(*bccspmsp).bccsp.GetHash(hashOpt)
-	require.NoError(t, err)
-	// Skipping first cert because it belongs to the identity
-	for i := 1; i < len(chain); i++ {
-		hf.Write(chain[i].Raw)
-	}
-	sum := hf.Sum(nil)
-
-	require.Equal(t, sum, id.GetOrganizationalUnits()[0].CertifiersIdentifier)
-}
-
-func TestOUPolicyPrincipal(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	cid, err := localMsp.(*bccspmsp).getCertificationChainIdentifier(id.GetPublicVersion())
-	require.NoError(t, err)
-
-	ou := &msp.OrganizationUnit{
-		OrganizationalUnitIdentifier: "COP",
-		MspIdentifier:                "SampleOrg",
-		CertifiersIdentifier:         cid,
-	}
-	bytes, err := proto.Marshal(ou)
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ORGANIZATION_UNIT,
-		Principal:               bytes,
-	}
-
-	err = id.SatisfiesPrincipal(principal)
-	require.NoError(t, err)
-}
-
-func TestOUPolicyPrincipalBadPrincipal(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ORGANIZATION_UNIT,
-		Principal:               []byte("barf"),
-	}
-
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
-}
-
-func TestOUPolicyPrincipalBadMSPID(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	cid, err := localMsp.(*bccspmsp).getCertificationChainIdentifier(id.GetPublicVersion())
-	require.NoError(t, err)
-
-	ou := &msp.OrganizationUnit{
-		OrganizationalUnitIdentifier: "COP",
-		MspIdentifier:                "SampleOrgbarfbarf",
-		CertifiersIdentifier:         cid,
-	}
-	bytes, err := proto.Marshal(ou)
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ORGANIZATION_UNIT,
-		Principal:               bytes,
-	}
-
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
-}
-
-func TestOUPolicyPrincipalBadPath(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	ou := &msp.OrganizationUnit{
-		OrganizationalUnitIdentifier: "COP",
-		MspIdentifier:                "SampleOrg",
-		CertifiersIdentifier:         nil,
-	}
-	bytes, err := proto.Marshal(ou)
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ORGANIZATION_UNIT,
-		Principal:               bytes,
-	}
-
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
-
-	ou = &msp.OrganizationUnit{
-		OrganizationalUnitIdentifier: "COP",
-		MspIdentifier:                "SampleOrg",
-		CertifiersIdentifier:         []byte{0, 1, 2, 3, 4},
-	}
-	bytes, err = proto.Marshal(ou)
-	require.NoError(t, err)
-
-	principal = &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ORGANIZATION_UNIT,
-		Principal:               bytes,
-	}
-
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
-}
-
-func TestPolicyPrincipalBogusType(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principalBytes, err := proto.Marshal(&msp.MSPRole{Role: 35, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: 35,
-		Principal:               principalBytes,
-	}
-
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
-}
-
-func TestPolicyPrincipalBogusRole(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principalBytes, err := proto.Marshal(&msp.MSPRole{Role: 35, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               principalBytes,
-	}
-
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
-}
-
-func TestPolicyPrincipalWrongMSPID(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principalBytes, err := proto.Marshal(&msp.MSPRole{Role: msp.MSPRole_MEMBER, MspIdentifier: "SampleOrgBARFBARF"})
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               principalBytes,
-	}
-
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
-}
-
-func TestMemberPolicyPrincipal(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principalBytes, err := proto.Marshal(&msp.MSPRole{Role: msp.MSPRole_MEMBER, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               principalBytes,
-	}
-
-	err = id.SatisfiesPrincipal(principal)
-	require.NoError(t, err)
-}
-
-func TestAdminPolicyPrincipal(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principalBytes, err := proto.Marshal(&msp.MSPRole{Role: msp.MSPRole_ADMIN, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               principalBytes,
-	}
-
-	err = id.SatisfiesPrincipal(principal)
-	require.NoError(t, err)
-}
-
-// Combine one or more MSPPrincipals into a MSPPrincipal of type
-// MSPPrincipal_COMBINED.
-func createCombinedPrincipal(principals ...*msp.MSPPrincipal) (*msp.MSPPrincipal, error) {
-	if len(principals) == 0 {
-		return nil, errors.New("no principals in CombinedPrincipal")
-	}
-	principalsArray := append([]*msp.MSPPrincipal(nil), principals...)
-	combinedPrincipal := &msp.CombinedPrincipal{Principals: principalsArray}
-	combinedPrincipalBytes, err := proto.Marshal(combinedPrincipal)
+// NewBccspMspWithKeyStore allows to create a BCCSP-based MSP whose underlying
+// crypto material is available through the passed keystore
+func NewBccspMspWithKeyStore(version MSPVersion, keyStore bccsp.KeyStore, bccsp bccsp.BCCSP) (MSP, error) {
+	thisMSP, err := newBccspMsp(version, bccsp)
 	if err != nil {
 		return nil, err
 	}
-	principalsCombined := &msp.MSPPrincipal{PrincipalClassification: msp.MSPPrincipal_COMBINED, Principal: combinedPrincipalBytes}
-	return principalsCombined, nil
-}
 
-func TestMultilevelAdminAndMemberPolicyPrincipal(t *testing.T) {
-	id, err := localMspV13.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	adminPrincipalBytes, err := proto.Marshal(&msp.MSPRole{Role: msp.MSPRole_ADMIN, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	memberPrincipalBytes, err := proto.Marshal(&msp.MSPRole{Role: msp.MSPRole_MEMBER, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	adminPrincipal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               adminPrincipalBytes,
+	csp, err := sw.NewWithParams(
+		factory.GetDefaultOpts().SW.Security,
+		factory.GetDefaultOpts().SW.Hash,
+		keyStore)
+	if err != nil {
+		return nil, err
 	}
-
-	memberPrincipal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               memberPrincipalBytes,
-	}
-
-	// CombinedPrincipal with Admin and Member principals
-	levelOneCombinedPrincipal, err := createCombinedPrincipal(adminPrincipal, memberPrincipal)
-	require.NoError(t, err)
-	err = id.SatisfiesPrincipal(levelOneCombinedPrincipal)
-	require.NoError(t, err)
-
-	// Nested CombinedPrincipal
-	levelTwoCombinedPrincipal, err := createCombinedPrincipal(levelOneCombinedPrincipal)
-	require.NoError(t, err)
-	err = id.SatisfiesPrincipal(levelTwoCombinedPrincipal)
-	require.NoError(t, err)
-
-	// Double nested CombinedPrincipal
-	levelThreeCombinedPrincipal, err := createCombinedPrincipal(levelTwoCombinedPrincipal)
-	require.NoError(t, err)
-	err = id.SatisfiesPrincipal(levelThreeCombinedPrincipal)
-	require.NoError(t, err)
-}
-
-func TestMultilevelAdminAndMemberPolicyPrincipalPreV12(t *testing.T) {
-	id, err := localMspV11.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	adminPrincipalBytes, err := proto.Marshal(&msp.MSPRole{Role: msp.MSPRole_ADMIN, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	memberPrincipalBytes, err := proto.Marshal(&msp.MSPRole{Role: msp.MSPRole_MEMBER, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	adminPrincipal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               adminPrincipalBytes,
-	}
-
-	memberPrincipal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               memberPrincipalBytes,
-	}
-
-	// CombinedPrincipal with Admin and Member principals
-	levelOneCombinedPrincipal, err := createCombinedPrincipal(adminPrincipal, memberPrincipal)
-	require.NoError(t, err)
-	err = id.SatisfiesPrincipal(levelOneCombinedPrincipal)
-	require.Error(t, err)
-
-	// Nested CombinedPrincipal
-	levelTwoCombinedPrincipal, err := createCombinedPrincipal(levelOneCombinedPrincipal)
-	require.NoError(t, err)
-	err = id.SatisfiesPrincipal(levelTwoCombinedPrincipal)
-	require.Error(t, err)
-
-	// Double nested CombinedPrincipal
-	levelThreeCombinedPrincipal, err := createCombinedPrincipal(levelTwoCombinedPrincipal)
-	require.NoError(t, err)
-	err = id.SatisfiesPrincipal(levelThreeCombinedPrincipal)
-	require.Error(t, err)
-}
-
-func TestAdminPolicyPrincipalFails(t *testing.T) {
-	id, err := localMspV13.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principalBytes, err := proto.Marshal(&msp.MSPRole{Role: msp.MSPRole_ADMIN, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               principalBytes,
-	}
-
-	// remove the admin so validation will fail
-	localMspV13.(*bccspmsp).admins = make([]Identity, 0)
-
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
-}
-
-func TestMultilevelAdminAndMemberPolicyPrincipalFails(t *testing.T) {
-	id, err := localMspV13.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	adminPrincipalBytes, err := proto.Marshal(&msp.MSPRole{Role: msp.MSPRole_ADMIN, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	memberPrincipalBytes, err := proto.Marshal(&msp.MSPRole{Role: msp.MSPRole_MEMBER, MspIdentifier: "SampleOrg"})
-	require.NoError(t, err)
-
-	adminPrincipal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               adminPrincipalBytes,
-	}
-
-	memberPrincipal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ROLE,
-		Principal:               memberPrincipalBytes,
-	}
-
-	// remove the admin so validation will fail
-	localMspV13.(*bccspmsp).admins = make([]Identity, 0)
-
-	// CombinedPrincipal with Admin and Member principals
-	levelOneCombinedPrincipal, err := createCombinedPrincipal(adminPrincipal, memberPrincipal)
-	require.NoError(t, err)
-	err = id.SatisfiesPrincipal(levelOneCombinedPrincipal)
-	require.Error(t, err)
-
-	// Nested CombinedPrincipal
-	levelTwoCombinedPrincipal, err := createCombinedPrincipal(levelOneCombinedPrincipal)
-	require.NoError(t, err)
-	err = id.SatisfiesPrincipal(levelTwoCombinedPrincipal)
-	require.Error(t, err)
-
-	// Double nested CombinedPrincipal
-	levelThreeCombinedPrincipal, err := createCombinedPrincipal(levelTwoCombinedPrincipal)
-	require.NoError(t, err)
-	err = id.SatisfiesPrincipal(levelThreeCombinedPrincipal)
-	require.Error(t, err)
-}
-
-func TestIdentityExpiresAt(t *testing.T) {
-	thisMSP := getLocalMSP(t, "testdata/expiration")
-	require.NotNil(t, thisMSP)
-	si, err := thisMSP.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-	expirationDate := si.GetPublicVersion().ExpiresAt()
-	require.Equal(t, time.Date(2027, 8, 17, 12, 19, 48, 0, time.UTC), expirationDate)
-}
-
-func TestIdentityExpired(t *testing.T) {
-	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
-	require.NoError(t, err)
-
-	expiredCertsDir := "testdata/expired"
-	conf, err := GetLocalMspConfig(expiredCertsDir, nil, "SampleOrg")
-	require.NoError(t, err)
-
-	thisMSP, err := newBccspMsp(MSPv1_0, cryptoProvider)
-	require.NoError(t, err)
-
-	ks, err := sw.NewFileBasedKeyStore(nil, filepath.Join(expiredCertsDir, "keystore"), true)
-	require.NoError(t, err)
-
-	csp, err := sw.NewWithParams(256, "SHA2", ks)
-	require.NoError(t, err)
 	thisMSP.(*bccspmsp).bccsp = csp
 
-	err = thisMSP.Setup(conf)
+	return thisMSP, nil
+}
+
+func (msp *bccspmsp) getCertFromPem(idBytes []byte) (*x509.Certificate, error) {
+	if idBytes == nil {
+		return nil, errors.New("getCertFromPem error: nil idBytes")
+	}
+
+	// Decode the pem bytes
+	pemCert, _ := pem.Decode(idBytes)
+	if pemCert == nil {
+		return nil, errors.Errorf("getCertFromPem error: could not decode pem bytes [%v]", idBytes)
+	}
+
+	// get a cert
+	var cert *x509.Certificate
+	cert, err := x509.ParseCertificate(pemCert.Bytes)
 	if err != nil {
-		require.Contains(t, err.Error(), "signing identity expired")
-	} else {
-		t.Fatal("Should have failed when loading expired certs")
+		return nil, errors.Wrap(err, "getCertFromPem error: failed to parse x509 cert")
+	}
+
+	return cert, nil
+}
+
+func (msp *bccspmsp) getIdentityFromConf(idBytes []byte) (Identity, bccsp.Key, error) {
+	// get a cert
+	cert, err := msp.getCertFromPem(idBytes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// get the public key in the right format
+	certPubK, err := msp.bccsp.KeyImport(cert, &bccsp.X509PublicKeyImportOpts{Temporary: true})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	mspId, err := newIdentity(cert, certPubK, msp)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return mspId, certPubK, nil
+}
+
+func (msp *bccspmsp) getSigningIdentityFromConf(sidInfo *m.SigningIdentityInfo) (SigningIdentity, error) {
+	if sidInfo == nil {
+		return nil, errors.New("getIdentityFromBytes error: nil sidInfo")
+	}
+
+	// Extract the public part of the identity
+	idPub, pubKey, err := msp.getIdentityFromConf(sidInfo.PublicSigner)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find the matching private key in the BCCSP keystore
+	privKey, err := msp.bccsp.GetKey(pubKey.SKI())
+	// Less Secure: Attempt to import Private Key from KeyInfo, if BCCSP was not able to find the key
+	if err != nil {
+		mspLogger.Debugf("Could not find SKI [%s], trying PQKeyMaterial field: %+v\n", hex.EncodeToString(pubKey.SKI()), err)
+		if sidInfo.PrivateSigner == nil || sidInfo.PrivateSigner.KeyMaterial == nil {
+			return nil, errors.New("KeyMaterial not found in SigningIdentityInfo")
+		}
+
+		pemKey, _ := pem.Decode(sidInfo.PrivateSigner.KeyMaterial)
+		if pemKey == nil {
+			return nil, errors.Errorf("%s: wrong PEM encoding", sidInfo.PrivateSigner.KeyIdentifier)
+		}
+		privKey, err = msp.bccsp.KeyImport(pemKey.Bytes, &bccsp.DILITHIUMGoPublicKeyImportOpts{Temporary: true})
+		if err != nil {
+			return nil, errors.WithMessage(err, "getIdentityFromBytes error: Failed to import DILITHIUM private key")
+		}
+	}
+
+	mspLogger.Debug("Successfully extracted quantum-safe private key")
+
+	// get the peer signer
+	peerSigner, err := signer.New(msp.bccsp, privKey)
+	if err != nil {
+		return nil, errors.WithMessage(err, "getIdentityFromBytes error: Failed initializing bccspCryptoSigner")
+	}
+
+	return newSigningIdentity(idPub.(*identity).cert, idPub.(*identity).pk, peerSigner, msp)
+}
+
+// Setup sets up the internal data structures
+// for this MSP, given an MSPConfig ref; it
+// returns nil in case of success or an error otherwise
+func (msp *bccspmsp) Setup(conf1 *m.MSPConfig) error {
+	if conf1 == nil {
+		return errors.New("Setup error: nil conf reference")
+	}
+
+	// given that it's an msp of type fabric, extract the MSPConfig instance
+	conf := &m.FabricMSPConfig{}
+	err := proto.Unmarshal(conf1.Config, conf)
+	if err != nil {
+		return errors.Wrap(err, "failed unmarshalling fabric msp config")
+	}
+
+	// set the name for this msp
+	msp.name = conf.Name
+	mspLogger.Debugf("Setting up MSP instance %s", msp.name)
+
+	// setup
+	return msp.internalSetupFunc(conf)
+}
+
+// GetVersion returns the version of this MSP
+func (msp *bccspmsp) GetVersion() MSPVersion {
+	return msp.version
+}
+
+// GetType returns the type for this MSP
+func (msp *bccspmsp) GetType() ProviderType {
+	return FABRIC
+}
+
+// GetIdentifier returns the MSP identifier for this instance
+func (msp *bccspmsp) GetIdentifier() (string, error) {
+	return msp.name, nil
+}
+
+// GetTLSRootCerts returns the root certificates for this MSP
+func (msp *bccspmsp) GetTLSRootCerts() [][]byte {
+	return msp.tlsRootCerts
+}
+
+// GetTLSIntermediateCerts returns the intermediate root certificates for this MSP
+func (msp *bccspmsp) GetTLSIntermediateCerts() [][]byte {
+	return msp.tlsIntermediateCerts
+}
+
+// GetDefaultSigningIdentity returns the
+// default signing identity for this MSP (if any)
+func (msp *bccspmsp) GetDefaultSigningIdentity() (SigningIdentity, error) {
+	mspLogger.Debugf("Obtaining default signing identity")
+
+	if msp.signer == nil {
+		return nil, errors.New("this MSP does not possess a valid default signing identity")
+	}
+
+	return msp.signer, nil
+}
+
+// Validate attempts to determine whether
+// the supplied identity is valid according
+// to this MSP's roots of trust; it returns
+// nil in case the identity is valid or an
+// error otherwise
+func (msp *bccspmsp) Validate(id Identity) error {
+	mspLogger.Debugf("MSP %s validating identity", msp.name)
+
+	switch id := id.(type) {
+	// If this identity is of this specific type,
+	// this is how I can validate it given the
+	// root of trust this MSP has
+	case *identity:
+		return msp.validateIdentity(id)
+	default:
+		return errors.New("identity type not recognized")
 	}
 }
 
-func TestIdentityPolicyPrincipal(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	idSerialized, err := id.Serialize()
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_IDENTITY,
-		Principal:               idSerialized,
+// hasOURole checks that the identity belongs to the organizational unit
+// associated to the specified MSPRole.
+// This function does not check the certifiers identifier.
+// Appropriate validation needs to be enforced before.
+func (msp *bccspmsp) hasOURole(id Identity, mspRole m.MSPRole_MSPRoleType) error {
+	// Check NodeOUs
+	if !msp.ouEnforcement {
+		return errors.New("NodeOUs not activated. Cannot tell apart identities.")
 	}
 
-	err = id.SatisfiesPrincipal(principal)
-	require.NoError(t, err)
+	mspLogger.Debugf("MSP %s checking if the identity is a client", msp.name)
+
+	switch id := id.(type) {
+	// If this identity is of this specific type,
+	// this is how I can validate it given the
+	// root of trust this MSP has
+	case *identity:
+		return msp.hasOURoleInternal(id, mspRole)
+	default:
+		return errors.New("Identity type not recognized")
+	}
 }
 
-func TestIdentityPolicyPrincipalBadBytes(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_IDENTITY,
-		Principal:               []byte("barf"),
+func (msp *bccspmsp) hasOURoleInternal(id *identity, mspRole m.MSPRole_MSPRoleType) error {
+	var nodeOU *OUIdentifier
+	switch mspRole {
+	case m.MSPRole_CLIENT:
+		nodeOU = msp.clientOU
+	case m.MSPRole_PEER:
+		nodeOU = msp.peerOU
+	case m.MSPRole_ADMIN:
+		nodeOU = msp.adminOU
+	case m.MSPRole_ORDERER:
+		nodeOU = msp.ordererOU
+	default:
+		return errors.New("Invalid MSPRoleType. It must be CLIENT, PEER, ADMIN or ORDERER")
 	}
 
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
+	if nodeOU == nil {
+		return errors.Errorf("cannot test for classification, node ou for type [%s], not defined, msp: [%s]", mspRole, msp.name)
+	}
+
+	for _, OU := range id.GetOrganizationalUnits() {
+		if OU.OrganizationalUnitIdentifier == nodeOU.OrganizationalUnitIdentifier {
+			return nil
+		}
+	}
+
+	return errors.Errorf("The identity does not contain OU [%s], MSP: [%s]", mspRole, msp.name)
 }
 
-func TestMSPOus(t *testing.T) {
-	// Set the OUIdentifiers
-	backup := localMsp.(*bccspmsp).ouIdentifiers
-	defer func() { localMsp.(*bccspmsp).ouIdentifiers = backup }()
-	sid, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-	sidBytes, err := sid.Serialize()
-	require.NoError(t, err)
-	id, err := localMsp.DeserializeIdentity(sidBytes)
-	require.NoError(t, err)
+// DeserializeIdentity returns an Identity given the byte-level
+// representation of a SerializedIdentity struct
+func (msp *bccspmsp) DeserializeIdentity(serializedID []byte) (Identity, error) {
+	mspLogger.Debug("Obtaining identity")
 
-	localMsp.(*bccspmsp).ouIdentifiers = map[string][][]byte{
-		"COP": {id.GetOrganizationalUnits()[0].CertifiersIdentifier},
+	// We first deserialize to a SerializedIdentity to get the MSP ID
+	sId := &m.SerializedIdentity{}
+	err := proto.Unmarshal(serializedID, sId)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not deserialize a SerializedIdentity")
 	}
-	require.NoError(t, localMsp.Validate(id))
 
-	id, err = localMsp.DeserializeIdentity(sidBytes)
-	require.NoError(t, err)
-
-	localMsp.(*bccspmsp).ouIdentifiers = map[string][][]byte{
-		"COP2": {id.GetOrganizationalUnits()[0].CertifiersIdentifier},
+	if sId.Mspid != msp.name {
+		return nil, errors.Errorf("expected MSP ID %s, received %s", msp.name, sId.Mspid)
 	}
-	require.Error(t, localMsp.Validate(id))
 
-	id, err = localMsp.DeserializeIdentity(sidBytes)
-	require.NoError(t, err)
-
-	localMsp.(*bccspmsp).ouIdentifiers = map[string][][]byte{
-		"COP": {{0, 1, 2, 3, 4}},
-	}
-	require.Error(t, localMsp.Validate(id))
+	return msp.deserializeIdentityInternal(sId.IdBytes)
 }
 
-const othercert = `-----BEGIN CERTIFICATE-----
-MIIDAzCCAqigAwIBAgIBAjAKBggqhkjOPQQDAjBsMQswCQYDVQQGEwJHQjEQMA4G
-A1UECAwHRW5nbGFuZDEOMAwGA1UECgwFQmFyMTkxDjAMBgNVBAsMBUJhcjE5MQ4w
-DAYDVQQDDAVCYXIxOTEbMBkGCSqGSIb3DQEJARYMQmFyMTktY2xpZW50MB4XDTE3
-MDIwOTE2MDcxMFoXDTE4MDIxOTE2MDcxMFowfDELMAkGA1UEBhMCR0IxEDAOBgNV
-BAgMB0VuZ2xhbmQxEDAOBgNVBAcMB0lwc3dpY2gxDjAMBgNVBAoMBUJhcjE5MQ4w
-DAYDVQQLDAVCYXIxOTEOMAwGA1UEAwwFQmFyMTkxGTAXBgkqhkiG9w0BCQEWCkJh
-cjE5LXBlZXIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQlRSnAyD+ND6qmaRV7
-AS/BPJKX5dZt3gBe1v/RewOpc1zJeXQNWACAk0ae3mv5u9l0HxI6TXJIAQSwJACu
-Rqsyo4IBKTCCASUwCQYDVR0TBAIwADARBglghkgBhvhCAQEEBAMCBkAwMwYJYIZI
-AYb4QgENBCYWJE9wZW5TU0wgR2VuZXJhdGVkIFNlcnZlciBDZXJ0aWZpY2F0ZTAd
-BgNVHQ4EFgQUwHzbLJQMaWd1cpHdkSaEFxdKB1owgYsGA1UdIwSBgzCBgIAUYxFe
-+cXOD5iQ223bZNdOuKCRiTKhZaRjMGExCzAJBgNVBAYTAkdCMRAwDgYDVQQIDAdF
-bmdsYW5kMRAwDgYDVQQHDAdJcHN3aWNoMQ4wDAYDVQQKDAVCYXIxOTEOMAwGA1UE
-CwwFQmFyMTkxDjAMBgNVBAMMBUJhcjE5ggEBMA4GA1UdDwEB/wQEAwIFoDATBgNV
-HSUEDDAKBggrBgEFBQcDATAKBggqhkjOPQQDAgNJADBGAiEAuMq65lOaie4705Ol
-Ow52DjbaO2YuIxK2auBCqNIu0gECIQCDoKdUQ/sa+9Ah1mzneE6iz/f/YFVWo4EP
-HeamPGiDTQ==
------END CERTIFICATE-----
-`
-
-func TestIdentityPolicyPrincipalFails(t *testing.T) {
-	id, err := localMsp.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	sid, err := NewSerializedIdentity("SampleOrg", []byte(othercert))
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_IDENTITY,
-		Principal:               sid,
+// deserializeIdentityInternal returns an identity given its byte-level representation
+func (msp *bccspmsp) deserializeIdentityInternal(serializedIdentity []byte) (Identity, error) {
+	// This MSP will always deserialize certs this way
+	bl, _ := pem.Decode(serializedIdentity)
+	if bl == nil {
+		return nil, errors.New("could not decode the PEM structure")
+	}
+	cert, err := x509.ParseCertificate(bl.Bytes)
+	if err != nil {
+		return nil, errors.Wrap(err, "parseCertificate failed")
 	}
 
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
+	// Now we have the certificate; make sure that its fields
+	// (e.g. the Issuer.OU or the Subject.OU) match with the
+	// MSP id that this MSP has; otherwise it might be an attack
+	// TODO!
+	// We can't do it yet because there is no standardized way
+	// (yet) to encode the MSP ID into the x.509 body of a cert
+
+	pub, err := msp.bccsp.KeyImport(cert, &bccsp.X509PublicKeyImportOpts{Temporary: true})
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed to import certificate's public key")
+	}
+
+	return newIdentity(cert, pub, msp)
+}
+
+// SatisfiesPrincipal returns nil if the identity matches the principal or an error otherwise
+func (msp *bccspmsp) SatisfiesPrincipal(id Identity, principal *m.MSPPrincipal) error {
+	principals, err := collectPrincipals(principal, msp.GetVersion())
+	if err != nil {
+		return err
+	}
+	for _, principal := range principals {
+		err = msp.internalSatisfiesPrincipalInternalFunc(id, principal)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// collectPrincipals collects principals from combined principals into a single MSPPrincipal slice.
+func collectPrincipals(principal *m.MSPPrincipal, mspVersion MSPVersion) ([]*m.MSPPrincipal, error) {
+	switch principal.PrincipalClassification {
+	case m.MSPPrincipal_COMBINED:
+		// Combined principals are not supported in MSP v1.0 or v1.1
+		if mspVersion <= MSPv1_1 {
+			return nil, errors.Errorf("invalid principal type %d", int32(principal.PrincipalClassification))
+		}
+		// Principal is a combination of multiple principals.
+		principals := &m.CombinedPrincipal{}
+		err := proto.Unmarshal(principal.Principal, principals)
+		if err != nil {
+			return nil, errors.Wrap(err, "could not unmarshal CombinedPrincipal from principal")
+		}
+		// Return an error if there are no principals in the combined principal.
+		if len(principals.Principals) == 0 {
+			return nil, errors.New("No principals in CombinedPrincipal")
+		}
+		// Recursively call msp.collectPrincipals for all combined principals.
+		// There is no limit for the levels of nesting for the combined principals.
+		var principalsSlice []*m.MSPPrincipal
+		for _, cp := range principals.Principals {
+			internalSlice, err := collectPrincipals(cp, mspVersion)
+			if err != nil {
+				return nil, err
+			}
+			principalsSlice = append(principalsSlice, internalSlice...)
+		}
+		// All the combined principals have been collected into principalsSlice
+		return principalsSlice, nil
+	default:
+		return []*m.MSPPrincipal{principal}, nil
+	}
+}
+
+// satisfiesPrincipalInternalPreV13 takes as arguments the identity and the principal.
+// The function returns an error if one occurred.
+// The function implements the behavior of an MSP up to and including v1.1.
+func (msp *bccspmsp) satisfiesPrincipalInternalPreV13(id Identity, principal *m.MSPPrincipal) error {
+	switch principal.PrincipalClassification {
+	// in this case, we have to check whether the
+	// identity has a role in the msp - member or admin
+	case m.MSPPrincipal_ROLE:
+		// Principal contains the msp role
+		mspRole := &m.MSPRole{}
+		err := proto.Unmarshal(principal.Principal, mspRole)
+		if err != nil {
+			return errors.Wrap(err, "could not unmarshal MSPRole from principal")
+		}
+
+		// at first, we check whether the MSP
+		// identifier is the same as that of the identity
+		if mspRole.MspIdentifier != msp.name {
+			return errors.Errorf("the identity is a member of a different MSP (expected %s, got %s)", mspRole.MspIdentifier, id.GetMSPIdentifier())
+		}
+
+		// now we validate the different msp roles
+		switch mspRole.Role {
+		case m.MSPRole_MEMBER:
+			// in the case of member, we simply check
+			// whether this identity is valid for the MSP
+			mspLogger.Debugf("Checking if identity satisfies MEMBER role for %s", msp.name)
+			return msp.Validate(id)
+		case m.MSPRole_ADMIN:
+			mspLogger.Debugf("Checking if identity satisfies ADMIN role for %s", msp.name)
+			// in the case of admin, we check that the
+			// id is exactly one of our admins
+			if msp.isInAdmins(id.(*identity)) {
+				return nil
+			}
+			return errors.New("This identity is not an admin")
+		case m.MSPRole_CLIENT:
+			fallthrough
+		case m.MSPRole_PEER:
+			mspLogger.Debugf("Checking if identity satisfies role [%s] for %s", m.MSPRole_MSPRoleType_name[int32(mspRole.Role)], msp.name)
+			if err := msp.Validate(id); err != nil {
+				return errors.Wrapf(err, "The identity is not valid under this MSP [%s]", msp.name)
+			}
+
+			if err := msp.hasOURole(id, mspRole.Role); err != nil {
+				return errors.Wrapf(err, "The identity is not a [%s] under this MSP [%s]", m.MSPRole_MSPRoleType_name[int32(mspRole.Role)], msp.name)
+			}
+			return nil
+		default:
+			return errors.Errorf("invalid MSP role type %d", int32(mspRole.Role))
+		}
+	case m.MSPPrincipal_IDENTITY:
+		// in this case we have to deserialize the principal's identity
+		// and compare it byte-by-byte with our cert
+		principalId, err := msp.DeserializeIdentity(principal.Principal)
+		if err != nil {
+			return errors.WithMessage(err, "invalid identity principal, not a certificate")
+		}
+
+		if bytes.Equal(id.(*identity).cert.Raw, principalId.(*identity).cert.Raw) {
+			return principalId.Validate()
+		}
+
+		return errors.New("The identities do not match")
+	case m.MSPPrincipal_ORGANIZATION_UNIT:
+		// Principal contains the OrganizationUnit
+		OU := &m.OrganizationUnit{}
+		err := proto.Unmarshal(principal.Principal, OU)
+		if err != nil {
+			return errors.Wrap(err, "could not unmarshal OrganizationUnit from principal")
+		}
+
+		// at first, we check whether the MSP
+		// identifier is the same as that of the identity
+		if OU.MspIdentifier != msp.name {
+			return errors.Errorf("the identity is a member of a different MSP (expected %s, got %s)", OU.MspIdentifier, id.GetMSPIdentifier())
+		}
+
+		// we then check if the identity is valid with this MSP
+		// and fail if it is not
+		err = msp.Validate(id)
+		if err != nil {
+			return err
+		}
+
+		// now we check whether any of this identity's OUs match the requested one
+		for _, ou := range id.GetOrganizationalUnits() {
+			if ou.OrganizationalUnitIdentifier == OU.OrganizationalUnitIdentifier &&
+				bytes.Equal(ou.CertifiersIdentifier, OU.CertifiersIdentifier) {
+				return nil
+			}
+		}
+
+		// if we are here, no match was found, return an error
+		return errors.New("The identities do not match")
+	default:
+		return errors.Errorf("invalid principal type %d", int32(principal.PrincipalClassification))
+	}
+}
+
+// satisfiesPrincipalInternalV13 takes as arguments the identity and the principal.
+// The function returns an error if one occurred.
+// The function implements the additional behavior expected of an MSP starting from v1.3.
+// For pre-v1.3 functionality, the function calls the satisfiesPrincipalInternalPreV13.
+func (msp *bccspmsp) satisfiesPrincipalInternalV13(id Identity, principal *m.MSPPrincipal) error {
+	switch principal.PrincipalClassification {
+	case m.MSPPrincipal_COMBINED:
+		return errors.New("SatisfiesPrincipalInternal shall not be called with a CombinedPrincipal")
+	case m.MSPPrincipal_ANONYMITY:
+		anon := &m.MSPIdentityAnonymity{}
+		err := proto.Unmarshal(principal.Principal, anon)
+		if err != nil {
+			return errors.Wrap(err, "could not unmarshal MSPIdentityAnonymity from principal")
+		}
+		switch anon.AnonymityType {
+		case m.MSPIdentityAnonymity_ANONYMOUS:
+			return errors.New("Principal is anonymous, but X.509 MSP does not support anonymous identities")
+		case m.MSPIdentityAnonymity_NOMINAL:
+			return nil
+		default:
+			return errors.Errorf("Unknown principal anonymity type: %d", anon.AnonymityType)
+		}
+
+	default:
+		// Use the pre-v1.3 function to check other principal types
+		return msp.satisfiesPrincipalInternalPreV13(id, principal)
+	}
+}
+
+// satisfiesPrincipalInternalV142 takes as arguments the identity and the principal.
+// The function returns an error if one occurred.
+// The function implements the additional behavior expected of an MSP starting from v2.0.
+// For v1.3 functionality, the function calls the satisfiesPrincipalInternalPreV13.
+func (msp *bccspmsp) satisfiesPrincipalInternalV142(id Identity, principal *m.MSPPrincipal) error {
+	_, okay := id.(*identity)
+	if !okay {
+		return errors.New("invalid identity type, expected *identity")
+	}
+
+	switch principal.PrincipalClassification {
+	case m.MSPPrincipal_ROLE:
+		if !msp.ouEnforcement {
+			break
+		}
+
+		// Principal contains the msp role
+		mspRole := &m.MSPRole{}
+		err := proto.Unmarshal(principal.Principal, mspRole)
+		if err != nil {
+			return errors.Wrap(err, "could not unmarshal MSPRole from principal")
+		}
+
+		// at first, we check whether the MSP
+		// identifier is the same as that of the identity
+		if mspRole.MspIdentifier != msp.name {
+			return errors.Errorf("the identity is a member of a different MSP (expected %s, got %s)", mspRole.MspIdentifier, id.GetMSPIdentifier())
+		}
+
+		// now we validate the admin role only, the other roles are left to the v1.3 function
+		switch mspRole.Role {
+		case m.MSPRole_ADMIN:
+			mspLogger.Debugf("Checking if identity has been named explicitly as an admin for %s", msp.name)
+			// in the case of admin, we check that the
+			// id is exactly one of our admins
+			if msp.isInAdmins(id.(*identity)) {
+				return nil
+			}
+
+			// or it carries the Admin OU, in this case check that the identity is valid as well.
+			mspLogger.Debugf("Checking if identity carries the admin ou for %s", msp.name)
+			if err := msp.Validate(id); err != nil {
+				return errors.Wrapf(err, "The identity is not valid under this MSP [%s]", msp.name)
+			}
+
+			if err := msp.hasOURole(id, m.MSPRole_ADMIN); err != nil {
+				return errors.Wrapf(err, "The identity is not an admin under this MSP [%s]", msp.name)
+			}
+
+			return nil
+		case m.MSPRole_ORDERER:
+			mspLogger.Debugf("Checking if identity satisfies role [%s] for %s", m.MSPRole_MSPRoleType_name[int32(mspRole.Role)], msp.name)
+			if err := msp.Validate(id); err != nil {
+				return errors.Wrapf(err, "The identity is not valid under this MSP [%s]", msp.name)
+			}
+
+			if err := msp.hasOURole(id, mspRole.Role); err != nil {
+				return errors.Wrapf(err, "The identity is not a [%s] under this MSP [%s]", m.MSPRole_MSPRoleType_name[int32(mspRole.Role)], msp.name)
+			}
+			return nil
+		}
+	}
+
+	// Use the v1.3 function to check other principal types
+	return msp.satisfiesPrincipalInternalV13(id, principal)
+}
+
+func (msp *bccspmsp) isInAdmins(id *identity) bool {
+	for _, admincert := range msp.admins {
+		if bytes.Equal(id.cert.Raw, admincert.(*identity).cert.Raw) {
+			// we do not need to check whether the admin is a valid identity
+			// according to this MSP, since we already check this at Setup time
+			// if there is a match, we can just return
+			return true
+		}
+	}
+	return false
+}
+
+// getCertificationChain returns the certification chain of the passed identity within this msp
+func (msp *bccspmsp) getCertificationChain(id Identity) ([]*x509.Certificate, error) {
+	mspLogger.Debugf("MSP %s getting certification chain", msp.name)
+
+	switch id := id.(type) {
+	// If this identity is of this specific type,
+	// this is how I can validate it given the
+	// root of trust this MSP has
+	case *identity:
+		return msp.getCertificationChainForBCCSPIdentity(id)
+	default:
+		return nil, errors.New("identity type not recognized")
+	}
+}
+
+// getCertificationChainForBCCSPIdentity returns the certification chain of the passed bccsp identity within this msp
+func (msp *bccspmsp) getCertificationChainForBCCSPIdentity(id *identity) ([]*x509.Certificate, error) {
+	if id == nil {
+		return nil, errors.New("Invalid bccsp identity. Must be different from nil.")
+	}
+
+	// we expect to have a valid VerifyOptions instance
+	if msp.opts == nil {
+		return nil, errors.New("Invalid msp instance")
+	}
+
+	// CAs cannot be directly used as identities..
+	if id.cert.IsCA {
+		return nil, errors.New("An X509 certificate with Basic Constraint: " +
+			"Certificate Authority equals true cannot be used as an identity")
+	}
+
+	return msp.getValidationChain(id.cert, false)
+}
+
+func (msp *bccspmsp) getUniqueValidationChain(cert *x509.Certificate, opts x509.VerifyOptions) ([]*x509.Certificate, error) {
+	// ask golang to validate the cert for us based on the options that we've built at setup time
+	if msp.opts == nil {
+		return nil, errors.New("the supplied identity has no verify options")
+	}
+	validationChains, err := cert.Verify(opts)
+	if err != nil {
+		return nil, errors.WithMessage(err, "the supplied identity is not valid")
+	}
+
+	// we only support a single validation chain;
+	// if there's more than one then there might
+	// be unclarity about who owns the identity
+	if len(validationChains) != 1 {
+		return nil, errors.Errorf("this MSP only supports a single validation chain, got %d", len(validationChains))
+	}
+
+	// Make the additional verification checks that were done in Go 1.14.
+	err = verifyLegacyNameConstraints(validationChains[0])
+	if err != nil {
+		return nil, errors.WithMessage(err, "the supplied identity is not valid")
+	}
+
+	return validationChains[0], nil
 }
 
 var (
-	conf        *msp.MSPConfig
-	localMsp    MSP
-	localMspV11 MSP
-	localMspV13 MSP
+	oidExtensionSubjectAltName  = asn1.ObjectIdentifier{2, 5, 29, 17}
+	oidExtensionNameConstraints = asn1.ObjectIdentifier{2, 5, 29, 30}
 )
 
-// Required because deleting the cert or msp options from localMsp causes parallel tests to fail
-var (
-	localMspBad MSP
-	mspMgr      MSPManager
-)
-
-func TestMain(m *testing.M) {
-	var err error
-
-	mspDir := configtest.GetDevMspDir()
-	conf, err = GetLocalMspConfig(mspDir, nil, "SampleOrg")
-	if err != nil {
-		fmt.Printf("Setup should have succeeded, got err %s instead", err)
-		os.Exit(-1)
+// verifyLegacyNameConstraints exercises the name constraint validation rules
+// that were part of the certificate verification process in Go 1.14.
+//
+// If a signing certificate contains a name constratint, the leaf certificate
+// does not include SAN extensions, and the leaf's common name looks like a
+// host name, the validation would fail with an x509.CertificateInvalidError
+// and a rason of x509.NameConstraintsWithoutSANs.
+func verifyLegacyNameConstraints(chain []*x509.Certificate) error {
+	if len(chain) < 2 {
+		return nil
 	}
 
-	localMsp, err = newBccspMsp(MSPv1_0, factory.GetDefault())
-	if err != nil {
-		fmt.Printf("Constructor for msp should have succeeded, got err %s instead", err)
-		os.Exit(-1)
+	// Leaf certificates with SANs are fine.
+	if oidInExtensions(oidExtensionSubjectAltName, chain[0].Extensions) {
+		return nil
 	}
-
-	localMspBad, err = newBccspMsp(MSPv1_0, factory.GetDefault())
-	if err != nil {
-		fmt.Printf("Constructor for msp should have succeeded, got err %s instead", err)
-		os.Exit(-1)
+	// Leaf certificates without a hostname in CN are fine.
+	if !validHostname(chain[0].Subject.CommonName) {
+		return nil
 	}
-
-	localMspV13, err = newBccspMsp(MSPv1_3, factory.GetDefault())
-	if err != nil {
-		fmt.Printf("Constructor for V1.3 msp should have succeeded, got err %s instead", err)
-		os.Exit(-1)
+	// If an intermediate or root have a name constraint, validation
+	// would fail in Go 1.14.
+	for _, c := range chain[1:] {
+		if oidInExtensions(oidExtensionNameConstraints, c.Extensions) {
+			return x509.CertificateInvalidError{Cert: chain[0], Reason: x509.NameConstraintsWithoutSANs}
+		}
 	}
-
-	localMspV11, err = newBccspMsp(MSPv1_1, factory.GetDefault())
-	if err != nil {
-		fmt.Printf("Constructor for V1.1 msp should have succeeded, got err %s instead", err)
-		os.Exit(-1)
-	}
-
-	err = localMspV11.Setup(conf)
-	if err != nil {
-		fmt.Printf("Setup for V1.1 msp should have succeeded, got err %s instead", err)
-		os.Exit(-1)
-	}
-
-	err = localMspV13.Setup(conf)
-	if err != nil {
-		fmt.Printf("Setup for V1.3 msp should have succeeded, got err %s instead", err)
-		os.Exit(-1)
-	}
-
-	err = localMsp.Setup(conf)
-	if err != nil {
-		fmt.Printf("Setup for msp should have succeeded, got err %s instead", err)
-		os.Exit(-1)
-	}
-
-	err = localMspBad.Setup(conf)
-	if err != nil {
-		fmt.Printf("Setup for msp should have succeeded, got err %s instead", err)
-		os.Exit(-1)
-	}
-
-	mspMgr = NewMSPManager()
-	err = mspMgr.Setup([]MSP{localMsp})
-	if err != nil {
-		fmt.Printf("Setup for msp manager should have succeeded, got err %s instead", err)
-		os.Exit(-1)
-	}
-
-	id, err := localMsp.GetIdentifier()
-	if err != nil {
-		fmt.Println("Failed obtaining identifier for localMSP")
-		os.Exit(-1)
-	}
-
-	msps, err := mspMgr.GetMSPs()
-	if err != nil {
-		fmt.Println("Failed obtaining MSPs from MSP manager")
-		os.Exit(-1)
-	}
-
-	if msps[id] == nil {
-		fmt.Println("Couldn't find localMSP in MSP manager")
-		os.Exit(-1)
-	}
-
-	retVal := m.Run()
-	os.Exit(retVal)
+	return nil
 }
 
-func getIdentity(t *testing.T, path string) Identity {
-	mspDir := configtest.GetDevMspDir()
-	pems, err := getPemMaterialFromDir(filepath.Join(mspDir, path))
-	require.NoError(t, err)
-
-	id, _, err := localMsp.(*bccspmsp).getIdentityFromConf(pems[0])
-	require.NoError(t, err)
-
-	return id
+func oidInExtensions(oid asn1.ObjectIdentifier, exts []pkix.Extension) bool {
+	for _, ext := range exts {
+		if ext.Id.Equal(oid) {
+			return true
+		}
+	}
+	return false
 }
 
-func getLocalMSPWithVersionAndError(t *testing.T, dir string, version MSPVersion) (MSP, error) {
-	conf, err := GetLocalMspConfig(dir, nil, "SampleOrg")
-	require.NoError(t, err)
+// validHostname reports whether host is a valid hostname that can be matched or
+// matched against according to RFC 6125 2.2, with some leniency to accommodate
+// legacy values.
+//
+// This implementation is sourced from the standard library.
+func validHostname(host string) bool {
+	host = strings.TrimSuffix(host, ".")
 
-	ks, err := sw.NewFileBasedKeyStore(nil, filepath.Join(dir, "keystore"), true)
-	require.NoError(t, err)
-	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
-	require.NoError(t, err)
-	thisMSP, err := NewBccspMspWithKeyStore(version, ks, cryptoProvider)
-	require.NoError(t, err)
-
-	return thisMSP, thisMSP.Setup(conf)
-}
-
-func getLocalMSP(t *testing.T, dir string) MSP {
-	conf, err := GetLocalMspConfig(dir, nil, "SampleOrg")
-	require.NoError(t, err)
-
-	ks, err := sw.NewFileBasedKeyStore(nil, filepath.Join(dir, "keystore"), true)
-	require.NoError(t, err)
-
-	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
-	require.NoError(t, err)
-	thisMSP, err := NewBccspMspWithKeyStore(MSPv1_0, ks, cryptoProvider)
-	require.NoError(t, err)
-	err = thisMSP.Setup(conf)
-	require.NoError(t, err)
-
-	return thisMSP
-}
-
-func getLocalMSPWithVersion(t *testing.T, dir string, version MSPVersion) MSP {
-	conf, err := GetLocalMspConfig(dir, nil, "SampleOrg")
-	require.NoError(t, err)
-
-	ks, err := sw.NewFileBasedKeyStore(nil, filepath.Join(dir, "keystore"), true)
-	require.NoError(t, err)
-	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
-	require.NoError(t, err)
-	thisMSP, err := NewBccspMspWithKeyStore(version, ks, cryptoProvider)
-	require.NoError(t, err)
-
-	err = thisMSP.Setup(conf)
-	require.NoError(t, err)
-
-	return thisMSP
-}
-
-func TestCollectEmptyCombinedPrincipal(t *testing.T) {
-	var principalsArray []*msp.MSPPrincipal
-	combinedPrincipal := &msp.CombinedPrincipal{Principals: principalsArray}
-	combinedPrincipalBytes, err := proto.Marshal(combinedPrincipal)
-	require.NoError(t, err, "Error marshalling empty combined principal")
-	principalsCombined := &msp.MSPPrincipal{PrincipalClassification: msp.MSPPrincipal_COMBINED, Principal: combinedPrincipalBytes}
-	_, err = collectPrincipals(principalsCombined, MSPv1_3)
-	require.Error(t, err)
-}
-
-func TestCollectPrincipalContainingEmptyCombinedPrincipal(t *testing.T) {
-	var principalsArray []*msp.MSPPrincipal
-	combinedPrincipal := &msp.CombinedPrincipal{Principals: principalsArray}
-	combinedPrincipalBytes, err := proto.Marshal(combinedPrincipal)
-	require.NoError(t, err, "Error marshalling empty combined principal")
-	emptyPrincipal := &msp.MSPPrincipal{PrincipalClassification: msp.MSPPrincipal_COMBINED, Principal: combinedPrincipalBytes}
-	levelOneCombinedPrincipal, err := createCombinedPrincipal(emptyPrincipal)
-	require.NoError(t, err)
-	_, err = collectPrincipals(levelOneCombinedPrincipal, MSPv1_3)
-	require.Error(t, err)
-}
-
-func TestMSPIdentityIdentifier(t *testing.T) {
-	// testdata/mspid
-	// 1) a key and a signcert (used to populate the default signing identity) with the cert having a HighS signature
-	thisMSP := getLocalMSP(t, "testdata/mspid")
-
-	id, err := thisMSP.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-	err = id.Validate()
-	require.NoError(t, err)
-
-	// Check that the identity identifier is computed with the respect to the lowS signature
-
-	idid := id.GetIdentifier()
-	require.NotNil(t, idid)
-
-	// Load and parse cacaert and signcert from folder
-	pems, err := getPemMaterialFromDir("testdata/mspid/cacerts")
-	require.NoError(t, err)
-	bl, _ := pem.Decode(pems[0])
-	require.NotNil(t, bl)
-	caCertFromFile, err := x509.ParseCertificate(bl.Bytes)
-	require.NoError(t, err)
-
-	pems, err = getPemMaterialFromDir("testdata/mspid/signcerts")
-	require.NoError(t, err)
-	bl, _ = pem.Decode(pems[0])
-	require.NotNil(t, bl)
-	certFromFile, err := x509.ParseCertificate(bl.Bytes)
-	require.NoError(t, err)
-	// Check that the certificates' raws are different, meaning that the identity has been sanitised
-	require.NotEqual(t, certFromFile.Raw, id.(*signingidentity).cert)
-
-	// Check that certFromFile is in HighS
-	_, S, err := utils.UnmarshalECDSASignature(certFromFile.Signature)
-	require.NoError(t, err)
-	lowS, err := utils.IsLowS(caCertFromFile.PublicKey.(*ecdsa.PublicKey), S)
-	require.NoError(t, err)
-	require.False(t, lowS)
-
-	// Check that id.(*signingidentity).cert is in LoswS
-	_, S, err = utils.UnmarshalECDSASignature(id.(*signingidentity).cert.Signature)
-	require.NoError(t, err)
-	lowS, err = utils.IsLowS(caCertFromFile.PublicKey.(*ecdsa.PublicKey), S)
-	require.NoError(t, err)
-	require.True(t, lowS)
-
-	// Compute the digest for certFromFile
-	thisBCCSPMsp := thisMSP.(*bccspmsp)
-	hashOpt, err := bccsp.GetHashOpt(thisBCCSPMsp.cryptoConfig.IdentityIdentifierHashFunction)
-	require.NoError(t, err)
-	digest, err := thisBCCSPMsp.bccsp.Hash(certFromFile.Raw, hashOpt)
-	require.NoError(t, err)
-
-	// Compare with the digest computed from the sanitised cert
-	require.NotEqual(t, idid.Id, hex.EncodeToString(digest))
-}
-
-func TestAnonymityIdentity(t *testing.T) {
-	id, err := localMspV13.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principalBytes, err := proto.Marshal(&msp.MSPIdentityAnonymity{AnonymityType: msp.MSPIdentityAnonymity_NOMINAL})
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ANONYMITY,
-		Principal:               principalBytes,
+	if len(host) == 0 {
+		return false
 	}
 
-	err = id.SatisfiesPrincipal(principal)
-	require.NoError(t, err)
-}
-
-func TestAnonymityIdentityPreV12Fail(t *testing.T) {
-	id, err := localMspV11.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principalBytes, err := proto.Marshal(&msp.MSPIdentityAnonymity{AnonymityType: msp.MSPIdentityAnonymity_NOMINAL})
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ANONYMITY,
-		Principal:               principalBytes,
+	for i, part := range strings.Split(host, ".") {
+		if part == "" {
+			// Empty label.
+			return false
+		}
+		if i == 0 && part == "*" {
+			// Only allow full left-most wildcards, as those are the only ones
+			// we match, and matching literal '*' characters is probably never
+			// the expected behavior.
+			continue
+		}
+		for j, c := range part {
+			if 'a' <= c && c <= 'z' {
+				continue
+			}
+			if '0' <= c && c <= '9' {
+				continue
+			}
+			if 'A' <= c && c <= 'Z' {
+				continue
+			}
+			if c == '-' && j != 0 {
+				continue
+			}
+			if c == '_' || c == ':' {
+				// Not valid characters in hostnames, but commonly
+				// found in deployments outside the WebPKI.
+				continue
+			}
+			return false
+		}
 	}
 
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
+	return true
 }
 
-func TestAnonymityIdentityFail(t *testing.T) {
-	id, err := localMspV13.GetDefaultSigningIdentity()
-	require.NoError(t, err)
-
-	principalBytes, err := proto.Marshal(&msp.MSPIdentityAnonymity{AnonymityType: msp.MSPIdentityAnonymity_ANONYMOUS})
-	require.NoError(t, err)
-
-	principal := &msp.MSPPrincipal{
-		PrincipalClassification: msp.MSPPrincipal_ANONYMITY,
-		Principal:               principalBytes,
+func (msp *bccspmsp) getValidationChain(cert *x509.Certificate, isIntermediateChain bool) ([]*x509.Certificate, error) {
+	validationChain, err := msp.getUniqueValidationChain(cert, msp.getValidityOptsForCert(cert))
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed getting validation chain")
 	}
 
-	err = id.SatisfiesPrincipal(principal)
-	require.Error(t, err)
+	// we expect a chain of length at least 2
+	if len(validationChain) < 2 {
+		return nil, errors.Errorf("expected a chain of length at least 2, got %d", len(validationChain))
+	}
+
+	// check that the parent is a leaf of the certification tree
+	// if validating an intermediate chain, the first certificate will the parent
+	parentPosition := 1
+	if isIntermediateChain {
+		parentPosition = 0
+	}
+	if msp.certificationTreeInternalNodesMap[string(validationChain[parentPosition].Raw)] {
+		return nil, errors.Errorf("invalid validation chain. Parent certificate should be a leaf of the certification tree [%v]", cert.Raw)
+	}
+	return validationChain, nil
 }
 
-func TestProviderTypeToString(t *testing.T) {
-	// Check that the provider type is found for FABRIC
-	pt := ProviderTypeToString(FABRIC)
-	require.Equal(t, "bccsp", pt)
+// getCertificationChainIdentifier returns the certification chain identifier of the passed identity within this msp.
+// The identifier is computes as the SHA256 of the concatenation of the certificates in the chain.
+func (msp *bccspmsp) getCertificationChainIdentifier(id Identity) ([]byte, error) {
+	chain, err := msp.getCertificationChain(id)
+	if err != nil {
+		return nil, errors.WithMessagef(err, "failed getting certification chain for [%v]", id)
+	}
 
-	// Check that the provider type is found for IDEMIX
-	pt = ProviderTypeToString(IDEMIX)
-	require.Equal(t, "idemix", pt)
+	// chain[0] is the certificate representing the identity.
+	// It will be discarded
+	return msp.getCertificationChainIdentifierFromChain(chain[1:])
+}
 
-	// Check that the provider type is not found
-	pt = ProviderTypeToString(OTHER)
-	require.Equal(t, "", pt)
+func (msp *bccspmsp) getCertificationChainIdentifierFromChain(chain []*x509.Certificate) ([]byte, error) {
+	// Hash the chain
+	// Use the hash of the identity's certificate as id in the IdentityIdentifier
+	hashOpt, err := bccsp.GetHashOpt(msp.cryptoConfig.IdentityIdentifierHashFunction)
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed getting hash function options")
+	}
+
+	hf, err := msp.bccsp.GetHash(hashOpt)
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed getting hash function when computing certification chain identifier")
+	}
+	for i := 0; i < len(chain); i++ {
+		hf.Write(chain[i].Raw)
+	}
+	return hf.Sum(nil), nil
+}
+
+// sanitizeCert ensures that x509 certificates signed using ECDSA
+// do have signatures in Low-S. If this is not the case, the certificate
+// is regenerated to have a Low-S signature.
+func (msp *bccspmsp) sanitizeCert(cert *x509.Certificate) (*x509.Certificate, error) {
+	if isECDSASignedCert(cert) {
+		// Lookup for a parent certificate to perform the sanitization
+		var parentCert *x509.Certificate
+		chain, err := msp.getUniqueValidationChain(cert, msp.getValidityOptsForCert(cert))
+		if err != nil {
+			return nil, err
+		}
+
+		// at this point, cert might be a root CA certificate
+		// or an intermediate CA certificate
+		if cert.IsCA && len(chain) == 1 {
+			// cert is a root CA certificate
+			parentCert = cert
+		} else {
+			parentCert = chain[1]
+		}
+
+		// Sanitize
+		cert, err = sanitizeECDSASignedCert(cert, parentCert)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return cert, nil
+}
+
+// IsWellFormed checks if the given identity can be deserialized into its provider-specific form.
+// In this MSP implementation, well formed means that the PEM has a Type which is either
+// the string 'CERTIFICATE' or the Type is missing altogether.
+func (msp *bccspmsp) IsWellFormed(identity *m.SerializedIdentity) error {
+	bl, rest := pem.Decode(identity.IdBytes)
+	if bl == nil {
+		return errors.New("PEM decoding resulted in an empty block")
+	}
+	if len(rest) > 0 {
+		return errors.Errorf("identity %s for MSP %s has trailing bytes", string(identity.IdBytes), identity.Mspid)
+	}
+
+	// Important: This method looks very similar to getCertFromPem(idBytes []byte) (*x509.Certificate, error)
+	// But we:
+	// 1) Must ensure PEM block is of type CERTIFICATE or is empty
+	// 2) Must not replace getCertFromPem with this method otherwise we will introduce
+	//    a change in validation logic which will result in a chain fork.
+	if bl.Type != "CERTIFICATE" && bl.Type != "" {
+		return errors.Errorf("pem type is %s, should be 'CERTIFICATE' or missing", bl.Type)
+	}
+	cert, err := x509.ParseCertificate(bl.Bytes)
+	if err != nil {
+		return err
+	}
+
+	if !isECDSASignedCert(cert) {
+		return nil
+	}
+
+	return isIdentitySignedInCanonicalForm(cert.Signature, identity.Mspid, identity.IdBytes)
+}
+
+func isIdentitySignedInCanonicalForm(sig []byte, mspID string, pemEncodedIdentity []byte) error {
+	r, s, err := utils.UnmarshalECDSASignature(sig)
+	if err != nil {
+		return err
+	}
+
+	expectedSig, err := utils.MarshalECDSASignature(r, s)
+	if err != nil {
+		return err
+	}
+
+	if !bytes.Equal(expectedSig, sig) {
+		return errors.Errorf("identity %s for MSP %s has a non canonical signature",
+			string(pemEncodedIdentity), mspID)
+	}
+
+	return nil
 }
